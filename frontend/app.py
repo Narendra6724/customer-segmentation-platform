@@ -1,23 +1,55 @@
 """
 Streamlit Dashboard — Customer Segmentation Platform v2
 Pages: Login | Prediction | Analytics | CSV Upload | Admin Panel
+
+Self-contained version: calls backend services directly (no separate API server needed).
 """
 
+import sys
+import os
+
+# ---------------------------------------------------------------------------
+# Ensure the project root is on sys.path so 'backend' package is importable
+# ---------------------------------------------------------------------------
+_PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+
 import streamlit as st
-import requests
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 import matplotlib
 import io
+import csv
 
 matplotlib.use("Agg")
 
 # ---------------------------------------------------------------------------
-# Config
+# Import backend services directly (no HTTP needed)
 # ---------------------------------------------------------------------------
-API_URL = "http://127.0.0.1:8000"
+from backend.database.db import engine, Base, SessionLocal
+from backend.models import customer, user  # noqa: F401  — register ORM models
+from backend.services import model_service, db_service, user_service
+
+# ---------------------------------------------------------------------------
+# Initialise DB tables + seed users (idempotent — safe to call every run)
+# ---------------------------------------------------------------------------
+Base.metadata.create_all(bind=engine)
+user_service.seed_initial_users()
+
+# ---------------------------------------------------------------------------
+# Helper — get a DB session
+# ---------------------------------------------------------------------------
+def _get_db():
+    db = SessionLocal()
+    try:
+        return db
+    except Exception:
+        db.close()
+        raise
+
 
 st.set_page_config(
     page_title="Customer Segmentation AI",
@@ -136,22 +168,20 @@ def show_login():
                 if not email or not password:
                     st.error("Please enter both email and password.")
                 else:
+                    db = _get_db()
                     try:
-                        resp = requests.post(
-                            f"{API_URL}/auth/login",
-                            json={"email": email.strip(), "password": password},
-                            timeout=10,
-                        )
-                        if resp.status_code == 200:
-                            data = resp.json()
+                        result = user_service.authenticate(db, email.strip(), password)
+                        if result:
                             st.session_state.logged_in = True
-                            st.session_state.user_email = data["email"]
-                            st.session_state.user_role = data["role"]
+                            st.session_state.user_email = result["email"]
+                            st.session_state.user_role = result["role"]
                             st.rerun()
                         else:
                             st.error("❌ Invalid email or password.")
-                    except requests.exceptions.ConnectionError:
-                        st.error("⚠️ Cannot connect to backend. Is the API server running?")
+                    except Exception as e:
+                        st.error(f"⚠️ Authentication error: {e}")
+                    finally:
+                        db.close()
 
         st.markdown(
             "<div style='text-align:center; color:#666; font-size:0.8rem; margin-top:1rem;'>"
@@ -228,39 +258,44 @@ def show_app():
             )
 
         if st.button("🚀  Predict Segment", use_container_width=True):
-            with st.spinner("Calling prediction API..."):
+            with st.spinner("Running prediction..."):
+                db = _get_db()
                 try:
-                    payload = {"income": income, "spending": spending}
-                    if customer_id > 0:
-                        payload["customer_id"] = customer_id
-                    resp = requests.post(f"{API_URL}/predict", json=payload, timeout=10)
-                    if resp.status_code == 200:
-                        data = resp.json()
-                        c1, c2 = st.columns(2)
-                        with c1:
-                            st.markdown(
-                                f'<div class="metric-card"><p>Predicted Cluster</p>'
-                                f'<h2>Cluster {data["cluster"]}</h2></div>',
-                                unsafe_allow_html=True,
-                            )
-                        with c2:
-                            st.markdown(
-                                f'<div class="metric-card"><p>Segment Label</p>'
-                                f'<h2>{data["label"]}</h2></div>',
-                                unsafe_allow_html=True,
-                            )
+                    result = model_service.predict(income, spending)
+                    cust_id = customer_id if customer_id > 0 else db_service.get_next_customer_id(db)
+                    cust, _ = db_service.upsert_customer(
+                        db,
+                        customer_id=cust_id,
+                        income=income,
+                        spending=spending,
+                        cluster=result["cluster"],
+                        insight=result["insight"],
+                    )
+                    c1, c2 = st.columns(2)
+                    with c1:
                         st.markdown(
-                            f'<div class="insight-box">💡 <strong>Business Insight:</strong> '
-                            f'{data["insight"]}</div>',
+                            f'<div class="metric-card"><p>Predicted Cluster</p>'
+                            f'<h2>Cluster {result["cluster"]}</h2></div>',
                             unsafe_allow_html=True,
                         )
-                        st.success(f"Record saved — Customer ID: {data['customer_id']}")
-                    elif resp.status_code == 422:
-                        st.error("Validation error — check that income > 0 and spending is between 1-100.")
-                    else:
-                        st.error(f"API error {resp.status_code}: {resp.text}")
-                except requests.exceptions.ConnectionError:
-                    st.error("⚠️ Cannot connect to backend.")
+                    with c2:
+                        st.markdown(
+                            f'<div class="metric-card"><p>Segment Label</p>'
+                            f'<h2>{result["label"]}</h2></div>',
+                            unsafe_allow_html=True,
+                        )
+                    st.markdown(
+                        f'<div class="insight-box">💡 <strong>Business Insight:</strong> '
+                        f'{result["insight"]}</div>',
+                        unsafe_allow_html=True,
+                    )
+                    st.success(f"Record saved — Customer ID: {cust.customer_id}")
+                except FileNotFoundError as exc:
+                    st.error(f"⚠️ ML model not found: {exc}")
+                except Exception as e:
+                    st.error(f"⚠️ Prediction error: {e}")
+                finally:
+                    db.close()
 
     # ═══════════════════════════════════════════════════════════════════
     # PAGE 2: ANALYTICS (Enterprise Dashboard)
@@ -268,13 +303,9 @@ def show_app():
     elif page == "📊 Analytics":
         st.title("📊 Enterprise Analytics Dashboard")
 
+        db = _get_db()
         try:
-            resp = requests.get(f"{API_URL}/analytics/detailed", timeout=10)
-            if resp.status_code != 200:
-                st.error("Failed to fetch analytics.")
-                return
-
-            data = resp.json()
+            data = db_service.get_detailed_analytics(db)
             dist = data["distribution"]
             stats = data["cluster_stats"]
             customers = data["customers"]
@@ -462,10 +493,10 @@ def show_app():
                 use_container_width=True,
             )
 
-        except requests.exceptions.ConnectionError:
-            st.error("⚠️ Cannot connect to backend. Is the API server running?")
         except Exception as e:
             st.error(f"Unexpected error: {e}")
+        finally:
+            db.close()
 
     # ═══════════════════════════════════════════════════════════════════
     # PAGE 3: CSV UPLOAD
@@ -506,13 +537,41 @@ def show_app():
                 st.caption(f"...and {len(lines) - 10} more rows")
 
             if st.button("🚀 Upload & Process", use_container_width=True):
-                with st.spinner("Uploading and processing..."):
+                with st.spinner("Processing CSV..."):
+                    db = _get_db()
                     try:
                         uploaded.seek(0)
-                        files = {"file": (uploaded.name, uploaded, "text/csv")}
-                        resp = requests.post(f"{API_URL}/upload-csv", files=files, timeout=60)
-                        if resp.status_code == 200:
-                            summary = resp.json()
+                        raw = uploaded.read().decode("utf-8")
+                        reader = csv.reader(io.StringIO(raw))
+                        rows = []
+                        parse_errors = []
+
+                        for i, row in enumerate(reader, start=1):
+                            if not row or all(cell.strip() == "" for cell in row):
+                                continue
+                            if len(row) < 3:
+                                parse_errors.append({"row": i, "error": f"Expected 3 columns, got {len(row)}"})
+                                continue
+                            try:
+                                cust_id = int(row[0].strip())
+                                inc = float(row[1].strip())
+                                spend = float(row[2].strip())
+                                if spend < 1 or spend > 100:
+                                    parse_errors.append({"row": i, "error": f"Spending score {spend} out of range [1-100]"})
+                                    continue
+                                if inc <= 0:
+                                    parse_errors.append({"row": i, "error": f"Income must be > 0, got {inc}"})
+                                    continue
+                                rows.append((cust_id, inc, spend))
+                            except ValueError as e:
+                                parse_errors.append({"row": i, "error": f"Parse error: {e}"})
+
+                        if not rows and parse_errors:
+                            st.error("No valid rows found.")
+                            st.json(parse_errors[:20])
+                        else:
+                            summary = db_service.bulk_upsert_csv(db, rows)
+                            summary["errors"].extend(parse_errors)
                             st.success(
                                 f"✅ Upload complete — "
                                 f"**{summary['inserted']}** inserted, "
@@ -521,10 +580,10 @@ def show_app():
                             if summary.get("errors"):
                                 st.warning(f"⚠️ {len(summary['errors'])} row(s) had errors:")
                                 st.json(summary["errors"][:20])
-                        else:
-                            st.error(f"Upload failed ({resp.status_code}): {resp.text}")
-                    except requests.exceptions.ConnectionError:
-                        st.error("⚠️ Cannot connect to backend.")
+                    except Exception as e:
+                        st.error(f"⚠️ Upload error: {e}")
+                    finally:
+                        db.close()
 
     # ═══════════════════════════════════════════════════════════════════
     # PAGE 4: ADMIN PANEL (admin only)
@@ -532,20 +591,17 @@ def show_app():
     elif page == "👑 Admin Panel":
         st.title("👑 Admin Panel — User Management")
 
-        admin_headers = {"X-User-Role": "admin"}
-
         # --- Section: Current Users ---
         st.subheader("📋 Registered Users")
+        db = _get_db()
         try:
-            resp = requests.get(f"{API_URL}/admin/users", headers=admin_headers, timeout=10)
-            if resp.status_code == 200:
-                users = resp.json()
-                df_users = pd.DataFrame(users)
-                st.dataframe(df_users, use_container_width=True, hide_index=True)
-            else:
-                st.error("Failed to load users.")
-        except requests.exceptions.ConnectionError:
-            st.error("⚠️ Cannot connect to backend.")
+            users = user_service.list_users(db)
+            df_users = pd.DataFrame(users)
+            st.dataframe(df_users, use_container_width=True, hide_index=True)
+        except Exception as e:
+            st.error(f"⚠️ Failed to load users: {e}")
+        finally:
+            db.close()
 
         st.markdown("---")
 
@@ -563,22 +619,17 @@ def show_app():
                 elif not new_password:
                     st.error("Password is required.")
                 else:
+                    db = _get_db()
                     try:
-                        resp = requests.post(
-                            f"{API_URL}/admin/users",
-                            json={"email": new_email.strip(), "password": new_password, "role": new_role},
-                            headers=admin_headers,
-                            timeout=10,
-                        )
-                        if resp.status_code == 200:
-                            st.success(f"✅ User '{new_email}' created successfully!")
-                            st.rerun()
-                        elif resp.status_code == 409:
-                            st.error(f"User '{new_email}' already exists.")
-                        else:
-                            st.error(f"Error: {resp.text}")
-                    except requests.exceptions.ConnectionError:
-                        st.error("⚠️ Cannot connect to backend.")
+                        user_service.create_user(db, new_email.strip(), new_password, new_role)
+                        st.success(f"✅ User '{new_email}' created successfully!")
+                        st.rerun()
+                    except ValueError:
+                        st.error(f"User '{new_email}' already exists.")
+                    except Exception as e:
+                        st.error(f"Error: {e}")
+                    finally:
+                        db.close()
 
         st.markdown("---")
 
@@ -593,21 +644,16 @@ def show_app():
                 if not target_email or not new_pwd:
                     st.error("Both email and new password are required.")
                 else:
+                    db = _get_db()
                     try:
-                        resp = requests.put(
-                            f"{API_URL}/admin/users/password",
-                            json={"email": target_email.strip(), "new_password": new_pwd},
-                            headers=admin_headers,
-                            timeout=10,
-                        )
-                        if resp.status_code == 200:
-                            st.success(f"✅ Password updated for '{target_email}'.")
-                        elif resp.status_code == 404:
-                            st.error(f"User '{target_email}' not found.")
-                        else:
-                            st.error(f"Error: {resp.text}")
-                    except requests.exceptions.ConnectionError:
-                        st.error("⚠️ Cannot connect to backend.")
+                        user_service.change_password(db, target_email.strip(), new_pwd)
+                        st.success(f"✅ Password updated for '{target_email}'.")
+                    except ValueError:
+                        st.error(f"User '{target_email}' not found.")
+                    except Exception as e:
+                        st.error(f"Error: {e}")
+                    finally:
+                        db.close()
 
         st.markdown("---")
 
@@ -623,21 +669,17 @@ def show_app():
                 elif del_email.strip() == st.session_state.user_email:
                     st.error("❌ You cannot delete your own account.")
                 else:
+                    db = _get_db()
                     try:
-                        resp = requests.delete(
-                            f"{API_URL}/admin/users/{del_email.strip()}",
-                            headers=admin_headers,
-                            timeout=10,
-                        )
-                        if resp.status_code == 200:
+                        if user_service.delete_user(db, del_email.strip()):
                             st.success(f"✅ User '{del_email}' deleted.")
                             st.rerun()
-                        elif resp.status_code == 404:
-                            st.error(f"User '{del_email}' not found.")
                         else:
-                            st.error(f"Error: {resp.text}")
-                    except requests.exceptions.ConnectionError:
-                        st.error("⚠️ Cannot connect to backend.")
+                            st.error(f"User '{del_email}' not found.")
+                    except Exception as e:
+                        st.error(f"Error: {e}")
+                    finally:
+                        db.close()
 
 
 # ═══════════════════════════════════════════════════════════════════════════
